@@ -2,11 +2,15 @@ from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.db import transaction
-from .models import Order, OrderItem
+from django.shortcuts import get_object_or_404
+from .models import Order, OrderItem, Notification
 from apps.cart.models import Cart
+from apps.suppliers.models import Supplier
 from .serializers import (
-    OrderSerializer, OrderCreateSerializer, OrderStatusUpdateSerializer
+    OrderSerializer, OrderCreateSerializer, AdminOrderDetailSerializer,
+    OrderProcessSerializer, NotificationSerializer
 )
+from .services import OrderStateMachine
 
 
 class CreateOrderView(APIView):
@@ -82,32 +86,55 @@ class OrderDetailView(generics.RetrieveAPIView):
 
 class AdminOrderListView(generics.ListAPIView):
     """Admin: List all orders."""
-    queryset = Order.objects.all()
+    queryset = Order.objects.prefetch_related('supplier_request').all()
     serializer_class = OrderSerializer
     permission_classes = [permissions.IsAdminUser]
-    filterset_fields = ['order_status']
+    filterset_fields = ['order_status', 'payment_status']
     search_fields = ['user__username', 'user__email', 'id']
 
 
-class AdminOrderStatusView(APIView):
-    """Admin: Update order status."""
+class AdminOrderDetailView(generics.RetrieveAPIView):
+    """Admin: Get detailed order with activity logs and supplier request."""
+    queryset = Order.objects.all()
+    serializer_class = AdminOrderDetailSerializer
     permission_classes = [permissions.IsAdminUser]
 
-    def put(self, request, pk):
-        try:
-            order = Order.objects.get(pk=pk)
-        except Order.DoesNotExist:
-            return Response({'error': 'Order not found.'}, status=404)
 
-        serializer = OrderStatusUpdateSerializer(data=request.data)
+class AdminProcessOrderView(APIView):
+    """Admin: Move order to PROCESSING and assign to a supplier."""
+    permission_classes = [permissions.IsAdminUser]
+
+    def patch(self, request, pk):
+        order = get_object_or_404(Order, pk=pk)
+        serializer = OrderProcessSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        
+        supplier_id = serializer.validated_data['supplier_id']
+        supplier = get_object_or_404(Supplier, pk=supplier_id)
 
-        order.order_status = serializer.validated_data['order_status']
-        if serializer.validated_data.get('tracking_number'):
-            order.tracking_number = serializer.validated_data['tracking_number']
-        order.save()
+        try:
+            with transaction.atomic():
+                order, req = OrderStateMachine.process_order(order, request.user, supplier)
+                if serializer.validated_data.get('notes'):
+                    req.notes = serializer.validated_data['notes']
+                    req.save(update_fields=['notes'])
+            return Response(AdminOrderDetailSerializer(order).data)
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-        return Response(OrderSerializer(order).data)
+
+class AdminDeliverOrderView(APIView):
+    """Admin: Mark order as DELIVERED after supplier ships."""
+    permission_classes = [permissions.IsAdminUser]
+
+    def patch(self, request, pk):
+        order = get_object_or_404(Order, pk=pk)
+        try:
+            with transaction.atomic():
+                order = OrderStateMachine.mark_delivered(order, request.user)
+            return Response(AdminOrderDetailSerializer(order).data)
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class AdminDashboardView(APIView):
@@ -117,7 +144,7 @@ class AdminDashboardView(APIView):
     def get(self, request):
         from apps.products.models import Product
         from apps.users.models import User
-        from django.db.models import Sum, Count
+        from django.db.models import Sum
         from django.utils import timezone
         from datetime import timedelta
 
@@ -146,3 +173,22 @@ class AdminDashboardView(APIView):
                 Order.objects.all()[:5], many=True
             ).data,
         })
+
+
+# ─── Notifications ────────────────────────────────────────────
+
+class NotificationListView(generics.ListAPIView):
+    """List notifications for current user."""
+    serializer_class = NotificationSerializer
+
+    def get_queryset(self):
+        return Notification.objects.filter(user=self.request.user)
+
+
+class MarkNotificationReadView(APIView):
+    """Mark a notification as read."""
+    def patch(self, request, pk):
+        notif = get_object_or_404(Notification, pk=pk, user=request.user)
+        notif.is_read = True
+        notif.save(update_fields=['is_read'])
+        return Response({'status': 'ok'})

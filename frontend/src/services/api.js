@@ -117,9 +117,14 @@ export const orderAPI = {
   create: (data) => api.post('/orders/create/', data),
   getAll: () => api.get('/orders/'),
   getById: (id) => api.get(`/orders/${id}/`),
+  // Notifications
+  getNotifications: () => api.get('/orders/notifications/'),
+  markNotificationRead: (id) => api.patch(`/orders/notifications/${id}/read/`),
   // Admin
   adminList: (params) => api.get('/orders/admin/', { params }),
-  adminUpdateStatus: (id, data) => api.put(`/orders/admin/${id}/status/`, data),
+  adminDetail: (id) => api.get(`/orders/admin/${id}/`),
+  adminProcessing: (id, data) => api.patch(`/orders/admin/${id}/processing/`, data),
+  adminDelivered: (id) => api.patch(`/orders/admin/${id}/delivered/`),
   adminDashboard: () => api.get('/orders/admin/dashboard/'),
 };
 
@@ -140,10 +145,12 @@ export const supplierAPI = {
   delete: (id) => api.delete(`/suppliers/${id}/`),
   getPurchases: (params) => api.get('/suppliers/purchases/', { params }),
   createPurchase: (data) => api.post('/suppliers/purchases/', data),
-  // Supplier
+  // Supplier Order Fulfillment
   dashboard: () => api.get('/suppliers/dashboard/'),
   getOrders: (params) => api.get('/suppliers/orders/', { params }),
-  updateOrder: (id, data) => api.put(`/suppliers/orders/${id}/`, data),
+  acceptOrder: (id) => api.patch(`/suppliers/orders/${id}/accept/`),
+  rejectOrder: (id) => api.patch(`/suppliers/orders/${id}/reject/`),
+  shipOrder: (id, data) => api.patch(`/suppliers/orders/${id}/shipped/`, data),
 };
 
 // ─── Complaint APIs ──────────────────────────────────────────

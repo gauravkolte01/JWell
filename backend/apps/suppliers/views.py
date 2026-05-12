@@ -1,17 +1,20 @@
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from .models import Supplier, Purchase
+from apps.orders.models import SupplierRequest
+from apps.orders.services import OrderStateMachine
 from .serializers import (
-    SupplierSerializer, PurchaseSerializer,
-    PurchaseCreateSerializer, SupplierOrderSerializer
+    SupplierSerializer, PurchaseSerializer, PurchaseCreateSerializer,
+    SupplierRequestDetailSerializer
 )
 
 
 class IsSupplierUser(permissions.BasePermission):
     def has_permission(self, request, view):
         return request.user.is_authenticated and request.user.role == 'supplier'
-
 
 # ─── Admin Views ──────────────────────────────────────────────
 
@@ -31,7 +34,7 @@ class SupplierDetailView(generics.RetrieveUpdateDestroyAPIView):
 
 
 class PurchaseListCreateView(generics.ListCreateAPIView):
-    """Admin: List/Create purchase orders."""
+    """Admin: List/Create internal purchase orders (inventory)."""
     queryset = Purchase.objects.all()
     permission_classes = [permissions.IsAdminUser]
     filterset_fields = ['status', 'supplier']
@@ -43,16 +46,16 @@ class PurchaseListCreateView(generics.ListCreateAPIView):
 
 
 class PurchaseDetailView(generics.RetrieveUpdateAPIView):
-    """Admin: Manage purchase order."""
+    """Admin: Manage internal purchase order."""
     queryset = Purchase.objects.all()
     serializer_class = PurchaseSerializer
     permission_classes = [permissions.IsAdminUser]
 
 
-# ─── Supplier Views ──────────────────────────────────────────
+# ─── Supplier Order Fulfillment Views ───────────────────────────
 
 class SupplierDashboardView(APIView):
-    """Supplier: Dashboard stats."""
+    """Supplier: Dashboard stats based on SupplierRequests."""
     permission_classes = [IsSupplierUser]
 
     def get(self, request):
@@ -61,60 +64,89 @@ class SupplierDashboardView(APIView):
         except Supplier.DoesNotExist:
             return Response({'error': 'Supplier profile not found.'}, status=404)
 
-        purchases = Purchase.objects.filter(supplier=supplier)
+        requests = SupplierRequest.objects.filter(supplier=supplier)
         return Response({
-            'total_orders': purchases.count(),
-            'pending': purchases.filter(status='pending').count(),
-            'accepted': purchases.filter(status='accepted').count(),
-            'preparing': purchases.filter(status='preparing').count(),
-            'dispatched': purchases.filter(status='dispatched').count(),
-            'received': purchases.filter(status='received').count(),
+            'total_requests': requests.count(),
+            'pending': requests.filter(status='pending').count(),
+            'accepted': requests.filter(status='accepted').count(),
+            'shipped': requests.filter(status='shipped').count(),
+            'rejected': requests.filter(status='rejected').count(),
         })
 
 
 class SupplierOrderListView(generics.ListAPIView):
-    """Supplier: List incoming purchase orders."""
-    serializer_class = SupplierOrderSerializer
+    """Supplier: List incoming order requests for fulfillment."""
+    serializer_class = SupplierRequestDetailSerializer
     permission_classes = [IsSupplierUser]
     filterset_fields = ['status']
 
     def get_queryset(self):
-        return Purchase.objects.filter(supplier=self.request.user.supplier_profile)
+        return SupplierRequest.objects.filter(supplier=self.request.user.supplier_profile)
 
 
-class SupplierOrderUpdateView(APIView):
-    """Supplier: Accept/Reject/Update order status."""
+class SupplierAcceptOrderView(APIView):
+    """Supplier: Accept an order request."""
     permission_classes = [IsSupplierUser]
 
-    def put(self, request, pk):
+    def patch(self, request, pk):
+        req = get_object_or_404(SupplierRequest, pk=pk, supplier=request.user.supplier_profile)
+        if req.status != 'pending':
+            return Response({'error': 'Only pending requests can be accepted.'}, status=400)
+            
+        req.status = 'accepted'
+        req.accepted_at = timezone.now()
+        req.save()
+        
+        OrderStateMachine._log_activity(
+            req.order, 'Supplier Accepted', request.user, 'pending', 'accepted',
+            f"Supplier {req.supplier.name} accepted the request."
+        )
+        
+        # Notify admin
+        OrderStateMachine._notify(
+            req.order.user, req.order, 
+            f"Supplier {req.supplier.name} has accepted order #{req.order.id}.",
+            'supplier_accepted'
+        )
+        
+        return Response(SupplierRequestDetailSerializer(req).data)
+
+
+class SupplierRejectOrderView(APIView):
+    """Supplier: Reject an order request."""
+    permission_classes = [IsSupplierUser]
+
+    def patch(self, request, pk):
+        req = get_object_or_404(SupplierRequest, pk=pk, supplier=request.user.supplier_profile)
+        if req.status != 'pending':
+            return Response({'error': 'Only pending requests can be rejected.'}, status=400)
+            
+        req.status = 'rejected'
+        req.rejected_at = timezone.now()
+        req.save()
+
+        OrderStateMachine._log_activity(
+            req.order, 'Supplier Rejected', request.user, 'pending', 'rejected',
+            f"Supplier {req.supplier.name} rejected the request."
+        )
+
+        return Response(SupplierRequestDetailSerializer(req).data)
+
+
+class SupplierShipOrderView(APIView):
+    """Supplier: Mark an accepted request as shipped."""
+    permission_classes = [IsSupplierUser]
+
+    def patch(self, request, pk):
+        req = get_object_or_404(SupplierRequest, pk=pk, supplier=request.user.supplier_profile)
+        if req.status != 'accepted':
+            return Response({'error': 'Only accepted requests can be shipped.'}, status=400)
+            
+        tracking_number = request.data.get('tracking_number')
+        
         try:
-            purchase = Purchase.objects.get(
-                pk=pk, supplier=request.user.supplier_profile
-            )
-        except Purchase.DoesNotExist:
-            return Response({'error': 'Order not found.'}, status=404)
-
-        new_status = request.data.get('status')
-        valid_transitions = {
-            'pending': ['accepted', 'rejected'],
-            'accepted': ['preparing'],
-            'preparing': ['dispatched'],
-        }
-
-        allowed = valid_transitions.get(purchase.status, [])
-        if new_status not in allowed:
-            return Response(
-                {'error': f'Cannot change from {purchase.status} to {new_status}.'},
-                status=400
-            )
-
-        purchase.status = new_status
-        purchase.save()
-
-        # If dispatched, update product stock
-        if new_status == 'dispatched':
-            product = purchase.product
-            product.stock_quantity += purchase.quantity
-            product.save(update_fields=['stock_quantity'])
-
-        return Response(SupplierOrderSerializer(purchase).data)
+            order = OrderStateMachine.mark_shipped(req.order, request.user, tracking_number)
+            req.refresh_from_db()
+            return Response(SupplierRequestDetailSerializer(req).data)
+        except ValueError as e:
+            return Response({'error': str(e)}, status=400)

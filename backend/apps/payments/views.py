@@ -102,9 +102,22 @@ class StripeWebhookView(APIView):
                 payment.stripe_payment_intent = session.get('payment_intent', '')
                 payment.save()
 
+                from apps.orders.services import OrderStateMachine
                 order = Order.objects.get(id=order_id)
-                order.order_status = 'confirmed'
-                order.save()
+                order.payment_status = 'success'
+                
+                if order.order_status == 'pending':
+                    order.order_status = 'confirmed'
+                    order.save()
+                    OrderStateMachine._log_activity(
+                        order, 'Payment Confirmed', None, 'pending', 'confirmed',
+                        "Payment completed via Stripe webhook."
+                    )
+                    OrderStateMachine._notify(
+                        order.user, order, "Your payment was successful and your order is confirmed.", 'payment_success'
+                    )
+                else:
+                    order.save()
             except (Payment.DoesNotExist, Order.DoesNotExist):
                 pass
 
@@ -146,9 +159,21 @@ class VerifyPaymentView(APIView):
                 payment.stripe_payment_intent = session.payment_intent
                 payment.save()
 
+                from apps.orders.services import OrderStateMachine
                 order = payment.order
+                order.payment_status = 'success'
+                
                 if order.order_status == 'pending':
                     order.order_status = 'confirmed'
+                    order.save()
+                    OrderStateMachine._log_activity(
+                        order, 'Payment Confirmed', None, 'pending', 'confirmed',
+                        "Payment verified via checkout redirect."
+                    )
+                    OrderStateMachine._notify(
+                        order.user, order, "Your payment was verified and your order is confirmed.", 'payment_success'
+                    )
+                else:
                     order.save()
 
                 return Response({
